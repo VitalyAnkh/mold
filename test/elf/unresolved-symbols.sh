@@ -1,4 +1,4 @@
-#!/bin/bash -x
+#!/bin/bash
 export LC_ALL=C
 set -e
 CC="${TEST_CC:-cc}"
@@ -18,19 +18,22 @@ int foo();
 int main() { foo(); }
 EOF
 
-! $CC -B. -o $t/exe $t/a.o
+! $CC -B. -o $t/exe $t/a.o 2>&1 | grep -q 'undefined.*foo'
 
-! $CC -B. -o $t/exe $t/a.o -Wl,-unresolved-symbols=report-all
+! $CC -B. -o $t/exe $t/a.o -Wl,-unresolved-symbols=report-all 2>&1 \
+  | grep -q 'undefined.*foo'
 
 $CC -B. -o $t/exe $t/a.o -Wl,-unresolved-symbols=ignore-all
 
 ! readelf --dyn-syms $t/exe | grep -w foo || false
 
 $CC -B. -o $t/exe $t/a.o -Wl,-unresolved-symbols=report-all \
-  -Wl,--warn-unresolved-symbols
+  -Wl,--warn-unresolved-symbols 2>&1 | grep -q 'undefined.*foo'
 
-! $CC -B. -o $t/exe $t/a.o -Wl,-unresolved-symbols=ignore-in-object-files
+! $CC -B. -o $t/exe $t/a.o -Wl,-unresolved-symbols=ignore-in-object-files 2>&1 \
+  | grep -q 'undefined.*foo'
 
-! $CC -B. -o $t/exe $t/a.o -Wl,-unresolved-symbols=ignore-in-shared-libs
+! $CC -B. -o $t/exe $t/a.o -Wl,-unresolved-symbols=ignore-in-shared-libs 2>&1 \
+  | grep -q 'undefined.*foo'
 
 echo OK
