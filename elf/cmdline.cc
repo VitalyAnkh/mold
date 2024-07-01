@@ -8,11 +8,11 @@
 #include <tbb/global_control.h>
 #include <unordered_set>
 
-#ifdef _WIN32
+#if __has_include(<unistd.h>)
+# include <unistd.h>
+#else
 # define isatty _isatty
 # define STDERR_FILENO (_fileno(stderr))
-#else
-# include <unistd.h>
 #endif
 
 namespace mold::elf {
@@ -522,7 +522,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
 
   bool version_shown = false;
   bool warn_shared_textrel = false;
+  bool error_unresolved_symbols = true;
   std::optional<SeparateCodeKind> z_separate_code;
+  std::optional<bool> report_undefined;
   std::optional<bool> z_relro;
   std::optional<u64> shuffle_sections_seed;
   std::unordered_set<std::string_view> rpaths;
@@ -540,16 +542,19 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if constexpr (is_riscv<E>)
     ctx.arg.discard_locals = true;
 
-  // It looks like the SPARC's dynamic linker takes both RELA's r_addend
-  // and the value at the relocated place. So we don't want to write
-  // values to relocated places.
-  if constexpr (is_sparc<E>)
-    ctx.arg.apply_dynamic_relocs = false;
-
-  // For some reason, SH4 always stores relocation addends to
-  // relocated places even though its RELA.
-  if constexpr (is_sh4<E>)
-    ctx.arg.apply_dynamic_relocs = true;
+  // We generally don't need to write addends to relocated places if the
+  // relocation type is RELA because RELA records contain addends.
+  // However, there are too much code that wrongly assumes that addends
+  // are written to both RELA records and relocated places, so we write
+  // addends to relocated places by default. There are a few exceptions:
+  //
+  // - It looks like the SPARC's dynamic linker takes both RELA's r_addend
+  //   and the value at the relocated place. So we don't want to write
+  //   values to relocated places.
+  //
+  // - Static PIE binaries crash on startup in some RISC-V environment if
+  //   we write addends to relocated places.
+  ctx.arg.apply_dynamic_relocs = !is_sparc<E> && !is_riscv<E>;
 
   auto read_arg = [&](std::string name) {
     for (const std::string &opt : add_dashes(name)) {
@@ -781,9 +786,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.unique = std::move(*pat);
     } else if (read_arg("unresolved-symbols")) {
       if (arg == "report-all" || arg == "ignore-in-shared-libs")
-        ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
+        report_undefined = true;
       else if (arg == "ignore-all" || arg == "ignore-in-object-files")
-        ctx.arg.unresolved_symbols = UNRESOLVED_IGNORE;
+        report_undefined = false;
       else
         Fatal(ctx) << "unknown --unresolved-symbols argument: " << arg;
     } else if (read_arg("undefined") || read_arg("u")) {
@@ -963,10 +968,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       z_relro = true;
     } else if (read_z_flag("norelro")) {
       z_relro = false;
-    } else if (read_z_flag("defs")) {
-      ctx.arg.z_defs = true;
+    } else if (read_z_flag("defs") || read_flag("no-undefined")) {
+      report_undefined = true;
     } else if (read_z_flag("undefs")) {
-      ctx.arg.z_defs = false;
+      report_undefined = false;
     } else if (read_z_flag("nodlopen")) {
       ctx.arg.z_dlopen = false;
     } else if (read_z_flag("nodelete")) {
@@ -1018,8 +1023,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_rewrite_endbr = true;
     } else if (read_z_flag("rodynamic")) {
       ctx.arg.z_rodynamic = true;
-    } else if (read_flag("no-undefined")) {
-      ctx.arg.z_defs = true;
     } else if (read_flag("nmagic")) {
       ctx.arg.nmagic = true;
     } else if (read_flag("no-nmagic")) {
@@ -1149,9 +1152,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("strip-debug") || read_flag("S")) {
       ctx.arg.strip_debug = true;
     } else if (read_flag("warn-unresolved-symbols")) {
-      ctx.arg.unresolved_symbols = UNRESOLVED_WARN;
+      error_unresolved_symbols = false;
     } else if (read_flag("error-unresolved-symbols")) {
-      ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
+      error_unresolved_symbols = true;
     } else if (read_arg("rpath")) {
       add_rpath(arg);
     } else if (read_arg("R")) {
@@ -1310,6 +1313,18 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.pic)
     ctx.arg.image_base = 0;
 
+  if (!report_undefined)
+    report_undefined = !ctx.arg.shared;
+
+  if (*report_undefined) {
+    if (error_unresolved_symbols)
+      ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
+    else
+      ctx.arg.unresolved_symbols = UNRESOLVED_WARN;
+  } else {
+    ctx.arg.unresolved_symbols = UNRESOLVED_IGNORE;
+  }
+
   if (ctx.arg.retain_symbols_file) {
     ctx.arg.strip_all = false;
     ctx.arg.discard_all = false;
@@ -1348,6 +1363,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
 
+  // Even though SH4 is RELA, addends in its relocation records are always
+  // zero, and actual addends are written to relocated places. So we need
+  // to handle it as an exception.
   if constexpr (!E::is_rela || is_sh4<E>)
     if (!ctx.arg.apply_dynamic_relocs)
       Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
